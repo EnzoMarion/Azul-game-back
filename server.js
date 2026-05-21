@@ -16,6 +16,8 @@ const WALL_ORDER = [
 ];
 
 const ROOM_CLEANUP_DELAY = 5 * 60 * 1000;
+const DISCONNECT_FORFEIT_DELAY = 60_000;
+const DISCONNECT_VOTE_DELAY = 30_000;
 
 const factoryCountForPlayers = (n) => n * 2 + 1;
 
@@ -42,7 +44,7 @@ const sortCenter = (gs) => {
 
 const nextPlayerIndex = (gs) => {
     const currentIndex = gs.players.findIndex(p => p.id === gs.currentPlayerId);
-    return ((currentIndex + 1) % gs.players.length) + 1;
+    return gs.players[(currentIndex + 1) % gs.players.length].id;
 };
 
 const endRound = (gs) => {
@@ -140,6 +142,93 @@ const allPlayersGone = (room) =>
     room.players.every(p => p.socketId === null) &&
     (!room.spectators || room.spectators.length === 0);
 
+
+function handlePlayerDisconnect(room, disconnectedPlayer) {
+    const connectedPlayers = room.players.filter(p => p.socketId !== null);
+
+    io.to(room.id).emit('opponent_disconnected', disconnectedPlayer.pseudo);
+
+    if (connectedPlayers.length === 1) {
+        io.to(room.id).emit('disconnect_countdown', {
+            seconds: 60,
+            disconnectedPseudo: disconnectedPlayer.pseudo,
+        });
+
+        room._disconnectTimer = setTimeout(() => {
+            const winner = connectedPlayers[0];
+            if (room.gameState) room.gameState.gameState = 'GAME_OVER';
+            io.to(room.id).emit('force_game_over', {
+                winnerPseudo: winner.pseudo,
+                reason: 'disconnect',
+            });
+            scheduleRoomCleanup(room);
+            broadcastRoomList();
+        }, DISCONNECT_FORFEIT_DELAY);
+
+    } else {
+        room._disconnectVotes = {
+            disconnectedPseudo: disconnectedPlayer.pseudo,
+            votes: {},
+            timer: setTimeout(() => resolveDisconnectionVote(room), DISCONNECT_VOTE_DELAY),
+        };
+
+        io.to(room.id).emit('disconnection_vote_request', {
+            disconnectedPseudo: disconnectedPlayer.pseudo,
+            remainingPlayers: connectedPlayers.map(p => p.pseudo),
+            timeoutSeconds: 30,
+        });
+    }
+}
+
+function resolveDisconnectionVote(room) {
+    if (!room._disconnectVotes) return;
+
+    const { disconnectedPseudo, votes } = room._disconnectVotes;
+    clearTimeout(room._disconnectVotes.timer);
+    room._disconnectVotes = null;
+
+    const connectedPlayers = room.players.filter(p => p.socketId !== null);
+    const cancelCount = Object.values(votes).filter(v => v === 'cancel').length;
+    const totalVoters = connectedPlayers.length;
+
+    if (cancelCount > totalVoters / 2) {
+        if (room.gameState) room.gameState.gameState = 'GAME_OVER';
+        io.to(room.id).emit('force_game_over', { winnerPseudo: null, reason: 'cancelled' });
+        scheduleRoomCleanup(room);
+        broadcastRoomList();
+        return;
+    }
+
+    room.players = room.players.filter(p => p.pseudo !== disconnectedPseudo);
+    room.players.forEach((p, i) => { p.index = i + 1; });
+    room.maxPlayers = room.players.length;
+
+    const gs = room.gameState;
+    if (gs) {
+        gs.players = gs.players.filter(p => p.pseudo !== disconnectedPseudo);
+        gs.players.forEach((p, i) => { p.id = i + 1; });
+
+        const newFactoryCount = factoryCountForPlayers(room.players.length);
+        if (gs.bag.length < newFactoryCount * 4) {
+            gs.bag = [...gs.bag, ...gs.discard].sort(() => Math.random() - 0.5);
+            gs.discard = [];
+        }
+        gs.factories = Array(newFactoryCount).fill(null).map(() => gs.bag.splice(0, 4));
+        gs.center = [];
+        gs.heldStones = null;
+        gs.currentPlayerId = 1;
+        gs.nextFirstPlayerId = 1;
+        gs.firstStonePicked = false;
+    }
+
+    io.to(room.id).emit('game_continued', {
+        removedPseudo: disconnectedPseudo,
+        newPlayerCount: room.players.length,
+    });
+    io.to(room.id).emit('game_update', sortCenter(gs));
+    broadcastRoomList();
+}
+
 io.on('connection', (socket) => {
     broadcastRoomList();
 
@@ -158,6 +247,8 @@ io.on('connection', (socket) => {
             spectators: [],
             gameState: null,
             _cleanupTimer: null,
+            _disconnectTimer: null,
+            _disconnectVotes: null,
         };
         rooms.set(roomId, room);
         socket.join(roomId);
@@ -171,7 +262,6 @@ io.on('connection', (socket) => {
         if (!room || room.players.length >= room.maxPlayers) return;
 
         const trimmedPseudo = pseudo.trim();
-
         const pseudoTaken = room.players.some(
             p => p.pseudo.toLowerCase() === trimmedPseudo.toLowerCase()
         );
@@ -212,10 +302,12 @@ io.on('connection', (socket) => {
 
     socket.on('rejoin_room', ({ roomId, pseudo }) => {
         const room = rooms.get(roomId);
-        if (!room) return;
+        if (!room) {
+            socket.emit('join_error', 'La partie n\'existe plus.');
+            return;
+        }
 
         const trimmedPseudo = pseudo.trim();
-
         const disconnectedSlot = room.players.find(
             p => p.socketId === null && p.pseudo.toLowerCase() === trimmedPseudo.toLowerCase()
         );
@@ -223,6 +315,17 @@ io.on('connection', (socket) => {
         if (!disconnectedSlot) {
             socket.emit('join_error', `Impossible de rejoindre : "${trimmedPseudo}" n'est pas déconnecté dans cette partie.`);
             return;
+        }
+
+        if (room._disconnectTimer) {
+            clearTimeout(room._disconnectTimer);
+            room._disconnectTimer = null;
+            io.to(roomId).emit('disconnect_countdown_cancelled');
+        }
+        if (room._disconnectVotes) {
+            clearTimeout(room._disconnectVotes.timer);
+            room._disconnectVotes = null;
+            io.to(roomId).emit('disconnection_vote_cancelled');
         }
 
         cancelRoomCleanup(room);
@@ -244,19 +347,43 @@ io.on('connection', (socket) => {
     socket.on('leave_room', ({ roomId }) => {
         const room = rooms.get(roomId);
         if (!room) return;
-        room.players = room.players.filter(p => p.socketId !== socket.id);
-        if (room.spectators) room.spectators = room.spectators.filter(id => id !== socket.id);
-        socket.leave(roomId);
 
-        if (allPlayersGone(room)) {
-            rooms.delete(roomId);
+        const isInGame = room.gameState?.gameState === 'PLAYING';
+        const player = room.players.find(p => p.socketId === socket.id);
+
+        if (isInGame && player) {
+            player.socketId = null;
+            socket.leave(roomId);
+            if (allPlayersGone(room)) {
+                scheduleRoomCleanup(room);
+            } else {
+                handlePlayerDisconnect(room, player);
+            }
         } else {
-            io.to(roomId).emit('room_players_update', {
-                players: room.players.map(p => p.pseudo),
-                maxPlayers: room.maxPlayers,
-            });
+            room.players = room.players.filter(p => p.socketId !== socket.id);
+            if (room.spectators) room.spectators = room.spectators.filter(id => id !== socket.id);
+            socket.leave(roomId);
+            if (allPlayersGone(room)) {
+                rooms.delete(roomId);
+            } else {
+                io.to(roomId).emit('room_players_update', {
+                    players: room.players.map(p => p.pseudo),
+                    maxPlayers: room.maxPlayers,
+                });
+            }
         }
         broadcastRoomList();
+    });
+    socket.on('disconnection_vote', ({ roomId, choice }) => {
+        const room = rooms.get(roomId);
+        if (!room || !room._disconnectVotes) return;
+        const player = room.players.find(p => p.socketId === socket.id);
+        if (!player) return;
+        room._disconnectVotes.votes[player.pseudo] = choice;
+
+        const connectedPlayers = room.players.filter(p => p.socketId !== null);
+        const allVoted = connectedPlayers.every(p => room._disconnectVotes.votes[p.pseudo] !== undefined);
+        if (allVoted) resolveDisconnectionVote(room);
     });
 
     socket.on('request_rematch', ({ roomId }) => {
@@ -267,17 +394,14 @@ io.on('connection', (socket) => {
             room.gameState.rematchVotes.push(socket.id);
         }
         io.to(roomId).emit('rematch_votes', room.gameState.rematchVotes.length);
-
         if (room.gameState.rematchVotes.length >= room.maxPlayers) {
-            const pseudos = room.players.map(p => p.pseudo);
-            room.gameState = initGameState(pseudos);
+            room.gameState = initGameState(room.players.map(p => p.pseudo));
             io.to(roomId).emit('game_update', sortCenter(room.gameState));
         }
     });
 
     const getRoomBySocket = (socketId) =>
         Array.from(rooms.values()).find(r => r.players.some(p => p.socketId === socketId));
-
     const getPlayerInRoom = (room, socketId) =>
         room.players.find(p => p.socketId === socketId);
 
@@ -286,7 +410,6 @@ io.on('connection', (socket) => {
         if (!room?.gameState || room.gameState.gameState !== 'PLAYING') return;
         const player = getPlayerInRoom(room, socket.id);
         if (!player || player.index !== room.gameState.currentPlayerId) return;
-
         const gs = room.gameState;
         gs.center.push(...gs.factories[factoryIndex].filter(s => s !== stoneType));
         const count = gs.factories[factoryIndex].filter(s => s === stoneType).length;
@@ -300,7 +423,6 @@ io.on('connection', (socket) => {
         if (!room?.gameState || room.gameState.gameState !== 'PLAYING') return;
         const player = getPlayerInRoom(room, socket.id);
         if (!player || player.index !== room.gameState.currentPlayerId) return;
-
         const gs = room.gameState;
         const p = gs.players.find(p => p.id === gs.currentPlayerId);
         if (!gs.firstStonePicked) {
@@ -319,25 +441,17 @@ io.on('connection', (socket) => {
         if (!room?.gameState || room.gameState.gameState !== 'PLAYING') return;
         const player = getPlayerInRoom(room, socket.id);
         if (!player || player.index !== room.gameState.currentPlayerId) return;
-
         const gs = room.gameState;
         if (!gs.heldStones) return;
-
         const p = gs.players.find(p => p.id === gs.currentPlayerId);
         const { type, count } = gs.heldStones;
         let remaining = count;
-
         while (remaining > 0 && p.floorLine.length < 7) { p.floorLine.push(type); remaining--; }
         if (remaining > 0) gs.discard.push(...Array(remaining).fill(type));
         gs.heldStones = null;
-
         const factoriesEmpty = gs.factories.every(f => f.length === 0) && gs.center.length === 0;
-        if (factoriesEmpty) {
-            endRound(gs);
-        } else {
-            gs.currentPlayerId = nextPlayerIndex(gs);
-        }
-
+        if (factoriesEmpty) endRound(gs);
+        else gs.currentPlayerId = nextPlayerIndex(gs);
         io.to(room.id).emit('game_update', sortCenter(gs));
     });
 
@@ -346,10 +460,8 @@ io.on('connection', (socket) => {
         if (!room?.gameState || room.gameState.gameState !== 'PLAYING') return;
         const player = getPlayerInRoom(room, socket.id);
         if (!player || player.index !== room.gameState.currentPlayerId) return;
-
         const gs = room.gameState;
         if (!gs.heldStones) return;
-
         const p = gs.players.find(p => p.id === gs.currentPlayerId);
         const { type, count } = gs.heldStones;
         const line = p.patternLines[lineIndex];
@@ -357,7 +469,6 @@ io.on('connection', (socket) => {
         const hasDiff = line.some(s => s !== null && s !== type);
         const inWall = p.wall[lineIndex][colInWall] !== null;
         let remaining = count;
-
         if (hasDiff || inWall) {
             while (remaining > 0 && p.floorLine.length < 7) { p.floorLine.push(type); remaining--; }
             if (remaining > 0) gs.discard.push(...Array(remaining).fill(type));
@@ -369,14 +480,9 @@ io.on('connection', (socket) => {
             if (remaining > 0) gs.discard.push(...Array(remaining).fill(type));
         }
         gs.heldStones = null;
-
         const factoriesEmpty = gs.factories.every(f => f.length === 0) && gs.center.length === 0;
-        if (factoriesEmpty) {
-            endRound(gs);
-        } else {
-            gs.currentPlayerId = nextPlayerIndex(gs);
-        }
-
+        if (factoriesEmpty) endRound(gs);
+        else gs.currentPlayerId = nextPlayerIndex(gs);
         io.to(room.id).emit('game_update', sortCenter(gs));
     });
 
@@ -388,19 +494,17 @@ io.on('connection', (socket) => {
                 player.socketId = null;
                 if (allPlayersGone(room)) {
                     scheduleRoomCleanup(room);
+                } else if (room.gameState?.gameState === 'PLAYING') {
+                    handlePlayerDisconnect(room, player);
                 } else {
-                    io.to(room.id).emit('opponent_disconnected');
+                    io.to(room.id).emit('opponent_disconnected', player.pseudo);
                 }
             }
         }
-
         rooms.forEach(r => {
             if (r.spectators) r.spectators = r.spectators.filter(id => id !== socket.id);
-            if (allPlayersGone(r) && !r._cleanupTimer) {
-                scheduleRoomCleanup(r);
-            }
+            if (allPlayersGone(r) && !r._cleanupTimer) scheduleRoomCleanup(r);
         });
-
         broadcastRoomList();
     });
 });
