@@ -81,6 +81,7 @@ const broadcastRoomList = () => {
     const list = Array.from(rooms.values()).map(r => ({
         id: r.id, name: r.name,
         playerCount: r.players.length,
+        spectatorCount: r.spectators ? r.spectators.length : 0,
         status: r.gameState ? r.gameState.gameState : 'WAITING',
         hasDisconnected: r.players.some(p => p.socketId === null),
     }));
@@ -112,6 +113,7 @@ io.on('connection', (socket) => {
         const list = Array.from(rooms.values()).map(r => ({
             id: r.id, name: r.name,
             playerCount: r.players.length,
+            spectatorCount: r.spectators ? r.spectators.length : 0,
             status: r.gameState ? r.gameState.gameState : 'WAITING',
             hasDisconnected: r.players.some(p => p.socketId === null),
         }));
@@ -124,6 +126,7 @@ io.on('connection', (socket) => {
             id: roomId,
             name: `Partie de ${pseudo}`,
             players: [{ socketId: socket.id, pseudo, index: 1 }],
+            spectators: [],
             gameState: null,
         };
         rooms.set(roomId, room);
@@ -145,6 +148,18 @@ io.on('connection', (socket) => {
         broadcastRoomList();
     });
 
+    socket.on('join_as_spectator', ({ roomId }) => {
+        const room = rooms.get(roomId);
+        if (!room?.gameState) return;
+        if (!room.spectators) room.spectators = [];
+        room.spectators.push(socket.id);
+        socket.join(roomId);
+        socket.emit('your_index', 0);
+        socket.emit('joined_room', roomId);
+        socket.emit('game_update', sortCenter(room.gameState));
+        broadcastRoomList();
+    });
+
     socket.on('rejoin_room', ({ roomId, pseudo }) => {
         const room = rooms.get(roomId);
         if (!room) return;
@@ -161,7 +176,6 @@ io.on('connection', (socket) => {
         socket.emit('your_index', existing.index);
         socket.emit('joined_room', roomId);
         if (room.gameState) socket.emit('game_update', sortCenter(room.gameState));
-
         socket.to(roomId).emit('opponent_reconnected', pseudo);
         broadcastRoomList();
     });
@@ -175,8 +189,11 @@ io.on('connection', (socket) => {
         const room = rooms.get(roomId);
         if (!room) return;
         room.players = room.players.filter(p => p.socketId !== socket.id);
+        if (room.spectators) room.spectators = room.spectators.filter(id => id !== socket.id);
         socket.leave(roomId);
-        if (room.players.length === 0) rooms.delete(roomId);
+        if (room.players.length === 0 && (!room.spectators || room.spectators.length === 0)) {
+            rooms.delete(roomId);
+        }
         broadcastRoomList();
     });
 
@@ -306,19 +323,27 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', () => {
         const room = getRoomBySocket(socket.id);
-        if (!room) return;
-
-        const player = room.players.find(p => p.socketId === socket.id);
-        if (player) player.socketId = null;
-
-        if (room.players.every(p => p.socketId === null)) {
-            room._cleanupTimer = setTimeout(() => {
-                rooms.delete(room.id);
-                broadcastRoomList();
-            }, 60000);
-        } else {
-            io.to(room.id).emit('opponent_disconnected');
+        if (room) {
+            const player = room.players.find(p => p.socketId === socket.id);
+            if (player) {
+                player.socketId = null;
+                if (room.players.every(p => p.socketId === null)) {
+                    room._cleanupTimer = setTimeout(() => {
+                        rooms.delete(room.id);
+                        broadcastRoomList();
+                    }, 60000);
+                } else {
+                    io.to(room.id).emit('opponent_disconnected');
+                }
+            }
         }
+
+        rooms.forEach((r) => {
+            if (r.spectators) {
+                r.spectators = r.spectators.filter(id => id !== socket.id);
+            }
+        });
+
         broadcastRoomList();
     });
 });
