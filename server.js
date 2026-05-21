@@ -15,7 +15,10 @@ const WALL_ORDER = [
     ['MIND','REALITY','POWER','TIME','SPACE'],
 ];
 
+const ROOM_CLEANUP_DELAY = 5 * 60 * 1000;
+
 const factoryCountForPlayers = (n) => n * 2 + 1;
+
 const createEmptyPlayer = (id, pseudo) => ({
     id, pseudo,
     patternLines: Array(5).fill(null).map((_, i) => Array(i + 1).fill(null)),
@@ -81,22 +84,6 @@ const endRound = (gs) => {
     }
 };
 
-const rooms = new Map();
-let roomCounter = 1;
-
-const broadcastRoomList = () => {
-    const list = Array.from(rooms.values()).map(r => ({
-        id: r.id,
-        name: r.name,
-        playerCount: r.players.length,
-        maxPlayers: r.maxPlayers,
-        spectatorCount: r.spectators ? r.spectators.length : 0,
-        status: r.gameState ? r.gameState.gameState : 'WAITING',
-        hasDisconnected: r.players.some(p => p.socketId === null),
-    }));
-    io.emit('room_list', list);
-};
-
 const initGameState = (pseudos) => {
     const playerCount = pseudos.length;
     const factoryCount = factoryCountForPlayers(playerCount);
@@ -118,20 +105,46 @@ const initGameState = (pseudos) => {
     };
 };
 
+const rooms = new Map();
+let roomCounter = 1;
+
+const buildRoomList = () =>
+    Array.from(rooms.values()).map(r => ({
+        id: r.id,
+        name: r.name,
+        playerCount: r.players.length,
+        maxPlayers: r.maxPlayers,
+        spectatorCount: r.spectators ? r.spectators.length : 0,
+        status: r.gameState ? r.gameState.gameState : 'WAITING',
+        hasDisconnected: r.players.some(p => p.socketId === null),
+    }));
+
+const broadcastRoomList = () => io.emit('room_list', buildRoomList());
+
+const scheduleRoomCleanup = (room) => {
+    if (room._cleanupTimer) clearTimeout(room._cleanupTimer);
+    room._cleanupTimer = setTimeout(() => {
+        rooms.delete(room.id);
+        broadcastRoomList();
+    }, ROOM_CLEANUP_DELAY);
+};
+
+const cancelRoomCleanup = (room) => {
+    if (room._cleanupTimer) {
+        clearTimeout(room._cleanupTimer);
+        room._cleanupTimer = null;
+    }
+};
+
+const allPlayersGone = (room) =>
+    room.players.every(p => p.socketId === null) &&
+    (!room.spectators || room.spectators.length === 0);
+
 io.on('connection', (socket) => {
     broadcastRoomList();
 
     socket.on('request_rooms', () => {
-        const list = Array.from(rooms.values()).map(r => ({
-            id: r.id,
-            name: r.name,
-            playerCount: r.players.length,
-            maxPlayers: r.maxPlayers,
-            spectatorCount: r.spectators ? r.spectators.length : 0,
-            status: r.gameState ? r.gameState.gameState : 'WAITING',
-            hasDisconnected: r.players.some(p => p.socketId === null),
-        }));
-        socket.emit('room_list', list);
+        socket.emit('room_list', buildRoomList());
     });
 
     socket.on('create_room', ({ pseudo, maxPlayers = 2 }) => {
@@ -141,9 +154,10 @@ io.on('connection', (socket) => {
             id: roomId,
             name: `Partie de ${pseudo}`,
             maxPlayers: clampedMax,
-            players: [{ socketId: socket.id, pseudo, index: 1 }],
+            players: [{ socketId: socket.id, pseudo: pseudo.trim(), index: 1 }],
             spectators: [],
             gameState: null,
+            _cleanupTimer: null,
         };
         rooms.set(roomId, room);
         socket.join(roomId);
@@ -155,8 +169,19 @@ io.on('connection', (socket) => {
     socket.on('join_room', ({ roomId, pseudo }) => {
         const room = rooms.get(roomId);
         if (!room || room.players.length >= room.maxPlayers) return;
+
+        const trimmedPseudo = pseudo.trim();
+
+        const pseudoTaken = room.players.some(
+            p => p.pseudo.toLowerCase() === trimmedPseudo.toLowerCase()
+        );
+        if (pseudoTaken) {
+            socket.emit('join_error', `Le pseudo "${trimmedPseudo}" est déjà utilisé dans cette partie.`);
+            return;
+        }
+
         const newIndex = room.players.length + 1;
-        room.players.push({ socketId: socket.id, pseudo, index: newIndex });
+        room.players.push({ socketId: socket.id, pseudo: trimmedPseudo, index: newIndex });
         socket.join(roomId);
         socket.emit('your_index', newIndex);
         socket.emit('joined_room', roomId);
@@ -188,20 +213,26 @@ io.on('connection', (socket) => {
     socket.on('rejoin_room', ({ roomId, pseudo }) => {
         const room = rooms.get(roomId);
         if (!room) return;
-        const existing = room.players.find(p => p.pseudo === pseudo);
-        if (!existing) return;
 
-        if (room._cleanupTimer) {
-            clearTimeout(room._cleanupTimer);
-            room._cleanupTimer = null;
+        const trimmedPseudo = pseudo.trim();
+
+        const disconnectedSlot = room.players.find(
+            p => p.socketId === null && p.pseudo.toLowerCase() === trimmedPseudo.toLowerCase()
+        );
+
+        if (!disconnectedSlot) {
+            socket.emit('join_error', `Impossible de rejoindre : "${trimmedPseudo}" n'est pas déconnecté dans cette partie.`);
+            return;
         }
 
-        existing.socketId = socket.id;
+        cancelRoomCleanup(room);
+
+        disconnectedSlot.socketId = socket.id;
         socket.join(roomId);
-        socket.emit('your_index', existing.index);
+        socket.emit('your_index', disconnectedSlot.index);
         socket.emit('joined_room', roomId);
         if (room.gameState) socket.emit('game_update', sortCenter(room.gameState));
-        socket.to(roomId).emit('opponent_reconnected', pseudo);
+        socket.to(roomId).emit('opponent_reconnected', trimmedPseudo);
         broadcastRoomList();
     });
 
@@ -216,8 +247,14 @@ io.on('connection', (socket) => {
         room.players = room.players.filter(p => p.socketId !== socket.id);
         if (room.spectators) room.spectators = room.spectators.filter(id => id !== socket.id);
         socket.leave(roomId);
-        if (room.players.length === 0 && (!room.spectators || room.spectators.length === 0)) {
+
+        if (allPlayersGone(room)) {
             rooms.delete(roomId);
+        } else {
+            io.to(roomId).emit('room_players_update', {
+                players: room.players.map(p => p.pseudo),
+                maxPlayers: room.maxPlayers,
+            });
         }
         broadcastRoomList();
     });
@@ -349,19 +386,19 @@ io.on('connection', (socket) => {
             const player = room.players.find(p => p.socketId === socket.id);
             if (player) {
                 player.socketId = null;
-                if (room.players.every(p => p.socketId === null)) {
-                    room._cleanupTimer = setTimeout(() => {
-                        rooms.delete(room.id);
-                        broadcastRoomList();
-                    }, 60000);
+                if (allPlayersGone(room)) {
+                    scheduleRoomCleanup(room);
                 } else {
                     io.to(room.id).emit('opponent_disconnected');
                 }
             }
         }
 
-        rooms.forEach((r) => {
+        rooms.forEach(r => {
             if (r.spectators) r.spectators = r.spectators.filter(id => id !== socket.id);
+            if (allPlayersGone(r) && !r._cleanupTimer) {
+                scheduleRoomCleanup(r);
+            }
         });
 
         broadcastRoomList();
