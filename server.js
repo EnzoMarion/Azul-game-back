@@ -15,25 +15,31 @@ const WALL_ORDER = [
     ['MIND','REALITY','POWER','TIME','SPACE'],
 ];
 
+const factoryCountForPlayers = (n) => n * 2 + 1;
 const createEmptyPlayer = (id, pseudo) => ({
     id, pseudo,
-    patternLines: Array(5).fill(null).map((_, i) => Array(i+1).fill(null)),
+    patternLines: Array(5).fill(null).map((_, i) => Array(i + 1).fill(null)),
     wall: Array(5).fill(null).map(() => Array(5).fill(null)),
     floorLine: [], score: 0,
 });
 
 const calculatePoints = (wall, row, col) => {
     let h = 0, v = 0;
-    for (let i = col+1; i < 5 && wall[row][i]; i++) h++;
-    for (let i = col-1; i >= 0 && wall[row][i]; i--) h++;
-    for (let i = row+1; i < 5 && wall[i][col]; i++) v++;
-    for (let i = row-1; i >= 0 && wall[i][col]; i--) v++;
+    for (let i = col + 1; i < 5 && wall[row][i]; i++) h++;
+    for (let i = col - 1; i >= 0 && wall[row][i]; i--) h++;
+    for (let i = row + 1; i < 5 && wall[i][col]; i++) v++;
+    for (let i = row - 1; i >= 0 && wall[i][col]; i--) v++;
     return 1 + (h > 0 ? h : 0) + (v > 0 ? v : 0);
 };
 
 const sortCenter = (gs) => {
     if (gs && gs.center) gs.center = [...gs.center].sort();
     return gs;
+};
+
+const nextPlayerIndex = (gs) => {
+    const currentIndex = gs.players.findIndex(p => p.id === gs.currentPlayerId);
+    return ((currentIndex + 1) % gs.players.length) + 1;
 };
 
 const endRound = (gs) => {
@@ -48,7 +54,7 @@ const endRound = (gs) => {
                 pl.patternLines[row] = Array(row + 1).fill(null);
             }
         });
-        const penalties = [-1,-1,-2,-2,-2,-3,-3];
+        const penalties = [-1, -1, -2, -2, -2, -3, -3];
         pl.floorLine.forEach((item, i) => {
             pl.score = Math.max(0, pl.score + (penalties[i] || -3));
             if (item !== 'FIRST_PLAYER') gs.discard.push(item);
@@ -64,11 +70,12 @@ const endRound = (gs) => {
         });
         gs.gameState = 'GAME_OVER';
     } else {
-        if (gs.bag.length < 20) {
+        const factoryCount = factoryCountForPlayers(gs.players.length);
+        if (gs.bag.length < factoryCount * 4) {
             gs.bag = [...gs.bag, ...gs.discard].sort(() => Math.random() - 0.5);
             gs.discard = [];
         }
-        gs.factories = Array(5).fill(null).map(() => gs.bag.splice(0, 4));
+        gs.factories = Array(factoryCount).fill(null).map(() => gs.bag.splice(0, 4));
         gs.firstStonePicked = false;
         gs.currentPlayerId = gs.nextFirstPlayerId;
     }
@@ -79,8 +86,10 @@ let roomCounter = 1;
 
 const broadcastRoomList = () => {
     const list = Array.from(rooms.values()).map(r => ({
-        id: r.id, name: r.name,
+        id: r.id,
+        name: r.name,
         playerCount: r.players.length,
+        maxPlayers: r.maxPlayers,
         spectatorCount: r.spectators ? r.spectators.length : 0,
         status: r.gameState ? r.gameState.gameState : 'WAITING',
         hasDisconnected: r.players.some(p => p.socketId === null),
@@ -89,19 +98,22 @@ const broadcastRoomList = () => {
 };
 
 const initGameState = (pseudos) => {
+    const playerCount = pseudos.length;
+    const factoryCount = factoryCountForPlayers(playerCount);
     let bag = [];
-    Object.values(STONE_TYPES).forEach(t => { for(let i=0;i<20;i++) bag.push(t); });
+    Object.values(STONE_TYPES).forEach(t => { for (let i = 0; i < 20; i++) bag.push(t); });
     bag = bag.sort(() => Math.random() - 0.5);
     return {
-        factories: Array(5).fill(null).map(() => bag.splice(0, 4)),
+        factories: Array(factoryCount).fill(null).map(() => bag.splice(0, 4)),
         center: [],
-        players: [
-            createEmptyPlayer(1, pseudos[0]),
-            createEmptyPlayer(2, pseudos[1]),
-        ],
-        currentPlayerId: 1, nextFirstPlayerId: 1,
-        heldStones: null, firstStonePicked: false,
-        gameState: 'PLAYING', bag, discard: [],
+        players: pseudos.map((pseudo, i) => createEmptyPlayer(i + 1, pseudo)),
+        currentPlayerId: 1,
+        nextFirstPlayerId: 1,
+        heldStones: null,
+        firstStonePicked: false,
+        gameState: 'PLAYING',
+        bag,
+        discard: [],
         rematchVotes: [],
     };
 };
@@ -111,8 +123,10 @@ io.on('connection', (socket) => {
 
     socket.on('request_rooms', () => {
         const list = Array.from(rooms.values()).map(r => ({
-            id: r.id, name: r.name,
+            id: r.id,
+            name: r.name,
             playerCount: r.players.length,
+            maxPlayers: r.maxPlayers,
             spectatorCount: r.spectators ? r.spectators.length : 0,
             status: r.gameState ? r.gameState.gameState : 'WAITING',
             hasDisconnected: r.players.some(p => p.socketId === null),
@@ -120,11 +134,13 @@ io.on('connection', (socket) => {
         socket.emit('room_list', list);
     });
 
-    socket.on('create_room', ({ pseudo }) => {
+    socket.on('create_room', ({ pseudo, maxPlayers = 2 }) => {
+        const clampedMax = Math.min(4, Math.max(2, maxPlayers));
         const roomId = `room_${roomCounter++}`;
         const room = {
             id: roomId,
             name: `Partie de ${pseudo}`,
+            maxPlayers: clampedMax,
             players: [{ socketId: socket.id, pseudo, index: 1 }],
             spectators: [],
             gameState: null,
@@ -138,13 +154,22 @@ io.on('connection', (socket) => {
 
     socket.on('join_room', ({ roomId, pseudo }) => {
         const room = rooms.get(roomId);
-        if (!room || room.players.length >= 2) return;
-        room.players.push({ socketId: socket.id, pseudo, index: 2 });
+        if (!room || room.players.length >= room.maxPlayers) return;
+        const newIndex = room.players.length + 1;
+        room.players.push({ socketId: socket.id, pseudo, index: newIndex });
         socket.join(roomId);
-        socket.emit('your_index', 2);
+        socket.emit('your_index', newIndex);
         socket.emit('joined_room', roomId);
-        room.gameState = initGameState([room.players[0].pseudo, pseudo]);
-        io.to(roomId).emit('game_update', sortCenter(room.gameState));
+
+        if (room.players.length === room.maxPlayers) {
+            room.gameState = initGameState(room.players.map(p => p.pseudo));
+            io.to(roomId).emit('game_update', sortCenter(room.gameState));
+        } else {
+            io.to(roomId).emit('room_players_update', {
+                players: room.players.map(p => p.pseudo),
+                maxPlayers: room.maxPlayers,
+            });
+        }
         broadcastRoomList();
     });
 
@@ -206,7 +231,7 @@ io.on('connection', (socket) => {
         }
         io.to(roomId).emit('rematch_votes', room.gameState.rematchVotes.length);
 
-        if (room.gameState.rematchVotes.length >= 2) {
+        if (room.gameState.rematchVotes.length >= room.maxPlayers) {
             const pseudos = room.players.map(p => p.pseudo);
             room.gameState = initGameState(pseudos);
             io.to(roomId).emit('game_update', sortCenter(room.gameState));
@@ -265,10 +290,7 @@ io.on('connection', (socket) => {
         const { type, count } = gs.heldStones;
         let remaining = count;
 
-        while (remaining > 0 && p.floorLine.length < 7) {
-            p.floorLine.push(type);
-            remaining--;
-        }
+        while (remaining > 0 && p.floorLine.length < 7) { p.floorLine.push(type); remaining--; }
         if (remaining > 0) gs.discard.push(...Array(remaining).fill(type));
         gs.heldStones = null;
 
@@ -276,7 +298,7 @@ io.on('connection', (socket) => {
         if (factoriesEmpty) {
             endRound(gs);
         } else {
-            gs.currentPlayerId = gs.currentPlayerId === 1 ? 2 : 1;
+            gs.currentPlayerId = nextPlayerIndex(gs);
         }
 
         io.to(room.id).emit('game_update', sortCenter(gs));
@@ -315,7 +337,7 @@ io.on('connection', (socket) => {
         if (factoriesEmpty) {
             endRound(gs);
         } else {
-            gs.currentPlayerId = gs.currentPlayerId === 1 ? 2 : 1;
+            gs.currentPlayerId = nextPlayerIndex(gs);
         }
 
         io.to(room.id).emit('game_update', sortCenter(gs));
@@ -339,9 +361,7 @@ io.on('connection', (socket) => {
         }
 
         rooms.forEach((r) => {
-            if (r.spectators) {
-                r.spectators = r.spectators.filter(id => id !== socket.id);
-            }
+            if (r.spectators) r.spectators = r.spectators.filter(id => id !== socket.id);
         });
 
         broadcastRoomList();
